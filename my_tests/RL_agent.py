@@ -4,100 +4,206 @@ import os
 import pickle
 import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta
-import yfinance as yf
-import requests
+from datetime import datetime
 import tensorflow as tf
 from tensorflow.keras.models import load_model
-import matplotlib.pyplot as plt
 import gym
 from gym import spaces
 import random
-model_dir = './model'
+from predicts import predict_future_prices
+
 # Suppress TensorFlow warnings
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
-# Custom Trading Environment
+# Custom Attention Layer
+class AttentionLayer(tf.keras.layers.Layer):
+    def __init__(self, **kwargs):
+        super(AttentionLayer, self).__init__(**kwargs)
+    
+    def build(self, input_shape):
+        self.W = self.add_weight(name='att_weight', 
+                                 shape=(input_shape[-1], 1),
+                                 initializer='random_normal',
+                                 trainable=True)
+        self.b = self.add_weight(name='att_bias', 
+                                 shape=(input_shape[1], 1),
+                                 initializer='zeros',
+                                 trainable=True)
+        super(AttentionLayer, self).build(input_shape)
+    
+    def call(self, inputs):
+        e = tf.keras.backend.tanh(tf.keras.backend.dot(inputs, self.W) + self.b)
+        e = tf.keras.backend.squeeze(e, axis=-1)
+        alpha = tf.keras.backend.softmax(e)
+        alpha = tf.keras.backend.expand_dims(alpha, axis=-1)
+        context = inputs * alpha
+        context = tf.keras.backend.sum(context, axis=1)
+        return context
+    
+    def compute_output_shape(self, input_shape):
+        return (input_shape[0], input_shape[-1])
+
+import numpy as np
+import gym
+from gym import spaces
+
 class TradingEnv(gym.Env):
-    """A custom trading environment for OpenAI Gym"""
+    """A more robust custom trading environment for OpenAI Gym."""
     metadata = {'render.modes': ['human']}
 
-    def __init__(self, data, initial_balance=10000):
+    def __init__(self, data, initial_balance=10000, annual_trading_days=252):
         super(TradingEnv, self).__init__()
 
-        # Historical data
+        required_columns = {'Close', 'RSI', 'MACD', 'MA10', 'MA50'}
+        missing_columns = required_columns - set(data.columns)
+        if missing_columns:
+            raise ValueError(f"Data is missing required columns: {missing_columns}")
+
         self.data = data.reset_index(drop=True)
-        self.n_steps = len(self.data) - 1
-        self.current_step = 0
 
-        # Wallet
+        # Parameters
+        self.initial_balance = initial_balance
         self.balance = initial_balance
-        self.net_worth = initial_balance
         self.crypto_held = 0
+        self.net_worth = initial_balance
+        self.max_net_worth = initial_balance
+        self.total_shares_sold = 0
+        self.total_sales_value = 0
+        self.trades = []
+        self.annual_trading_days = annual_trading_days
 
-        # Action space: 0 = Hold, 1 = Buy, 2 = Sell
-        self.action_space = spaces.Discrete(3)
+        # Calculate the total number of steps
+        self.n_steps = len(self.data) - 1
+        self.current_step = 50  # Start after enough data points for indicators
 
-        # Observation space: [Predicted_Price, Crypto_Held, Balance]
+        # Transaction cost parameters
+        self.transaction_cost_percent = 0.001  # 0.1% transaction cost per trade
+
+        # Define action and observation spaces
+        self.action_space = spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32)
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32)
+            low=-np.inf, high=np.inf, shape=(9,), dtype=np.float32)
+
+        # Historical performance tracking
+        self.net_worths = [self.net_worth]
 
     def reset(self):
-        self.balance = 10000
-        self.net_worth = 10000
+        """Reset the environment to initial state."""
+        self.balance = self.initial_balance
+        self.net_worth = self.initial_balance
         self.crypto_held = 0
-        self.current_step = 0
+        self.max_net_worth = self.initial_balance
+        self.total_shares_sold = 0
+        self.total_sales_value = 0
+        self.trades = []
+        self.current_step = 50  # Reset to the starting step
+        self.net_worths = [self.net_worth]
+
         return self._next_observation()
 
     def _next_observation(self):
+        """Get the data for the current step and assemble the observation."""
+        current_row = self.data.iloc[self.current_step]
+
         obs = np.array([
-            self.data.loc[self.current_step, 'Predicted_Price'],
+            current_row['Close'],
+            current_row['MA10'],
+            current_row['MA50'],
+            current_row['RSI'],
+            current_row['MACD'],
             self.crypto_held,
-            self.balance
-        ])
+            self.balance,
+            self.net_worth,
+            self.max_net_worth
+        ], dtype=np.float32)
         return obs
 
     def step(self, action):
+        """Execute one time step within the environment."""
+        # Execute the trade
+        self._take_action(action)
+
         self.current_step += 1
 
+        # Check if we have reached the end of the data
         done = self.current_step >= self.n_steps
 
-        current_price = self.data.loc[self.current_step, 'Close']
-        predicted_price = self.data.loc[self.current_step, 'Predicted_Price']
+        # Calculate the reward
+        reward = self._calculate_reward()
 
-        # Take action
-        if action == 0:  # Hold
-            pass
-        elif action == 1:  # Buy
-            max_crypto_can_buy = self.balance / current_price
-            self.crypto_held += max_crypto_can_buy
-            self.balance -= max_crypto_can_buy * current_price
-        elif action == 2:  # Sell
-            self.balance += self.crypto_held * current_price
-            self.crypto_held = 0
-
-        # Update net worth
-        self.net_worth = self.balance + self.crypto_held * current_price
-
-        # Calculate reward (profit or loss)
-        reward = self.net_worth - 10000  # Initial net worth
-
-        # Optional: Implement more complex reward function
-        # e.g., reward = (self.net_worth - prev_net_worth)
-
+        # Get the next observation
         obs = self._next_observation()
 
         return obs, reward, done, {}
 
-    def render(self, mode='human'):
-        profit = self.net_worth - 10000
-        print(f'Step: {self.current_step}')
-        print(f'Balance: {self.balance}')
-        print(f'Crypto Held: {self.crypto_held}')
-        print(f'Net Worth: {self.net_worth}')
-        print(f'Profit: {profit}')
+    def _take_action(self, action):
+        """Execute the trade based on the action."""
+        current_price = self.data.loc[self.current_step, 'Close']
+        action_type = np.clip(action[0], -1, 1)
 
-# RL Agent
+        # Calculate transaction cost
+        transaction_cost = 0
+
+        if action_type > 0:  # Buy
+            amount_to_invest = self.balance * action_type
+            num_shares = amount_to_invest / current_price
+            transaction_cost = amount_to_invest * self.transaction_cost_percent
+            total_cost = amount_to_invest + transaction_cost
+
+            if total_cost <= self.balance:
+                self.balance -= total_cost
+                self.crypto_held += num_shares
+                self.trades.append({'step': self.current_step, 'shares': num_shares, 'type': 'buy'})
+
+        elif action_type < 0:  # Sell
+            num_shares = self.crypto_held * (-action_type)
+            transaction_cost = (num_shares * current_price) * self.transaction_cost_percent
+            total_revenue = (num_shares * current_price) - transaction_cost
+
+            if num_shares <= self.crypto_held:
+                self.balance += total_revenue
+                self.crypto_held -= num_shares
+                self.total_shares_sold += num_shares
+                self.total_sales_value += total_revenue
+                self.trades.append({'step': self.current_step, 'shares': num_shares, 'type': 'sell'})
+
+        # Update net worth
+        self.net_worth = self.balance + self.crypto_held * current_price - transaction_cost
+        self.max_net_worth = max(self.max_net_worth, self.net_worth)
+        self.net_worths.append(self.net_worth)
+
+    def _calculate_reward(self):
+        """Calculate the reward for the current step."""
+        # Reward is the percentage change in net worth
+        if len(self.net_worths) > 1:
+            reward = (self.net_worths[-1] - self.net_worths[-2]) / self.net_worths[-2]
+        else:
+            reward = 0
+
+        # Penalize large drawdowns
+        drawdown = (self.max_net_worth - self.net_worth) / self.max_net_worth
+        if drawdown > 0.2:
+            reward -= drawdown  # Penalize for drawdown
+
+        return reward
+
+    def render(self, mode='human', close=False):
+        """Render the environment to the screen."""
+        profit = self.net_worth - self.initial_balance
+        print(f'Step: {self.current_step}')
+        print(f'Balance: {self.balance:.2f}')
+        print(f'Crypto Held: {self.crypto_held:.6f}')
+        print(f'Net Worth: {self.net_worth:.2f}')
+        print(f'Profit: {profit:.2f}')
+
+    def get_annual_return(self):
+        """Calculate the annualized return."""
+        total_return = (self.net_worth - self.initial_balance) / self.initial_balance
+        num_days = self.current_step
+        annual_return = (1 + total_return) ** (self.annual_trading_days / num_days) - 1
+        return annual_return
+
+# RL Trading Agent
 class RLTradingAgent:
     def __init__(self, memory_file='memory.pkl'):
         self.env = None
@@ -105,15 +211,13 @@ class RLTradingAgent:
         self.memory = []
         self.memory_file = memory_file
 
-        # Hyperparameters
-        self.gamma = 0.95
-        self.epsilon = 1.0
+        self.gamma = 0.99
+        self.epsilon = 1.0   # Initial exploration rate
         self.epsilon_min = 0.01
         self.epsilon_decay = 0.995
-        self.batch_size = 32
-        self.episodes = 50
+        self.batch_size = 64
+        self.episodes = 100
 
-        # Attempt to load existing memory
         if os.path.exists(self.memory_file):
             with open(self.memory_file, 'rb') as f:
                 self.memory = pickle.load(f)
@@ -123,46 +227,44 @@ class RLTradingAgent:
             print("Initialized new memory buffer.")
 
     def learn(self, start_date, end_date):
-        """Initial training of the RL agent."""
-        # Load and prepare data
+        """Train the RL agent."""
         data = self._prepare_data(start_date, end_date)
-
-        # Create environment
+        print("Prepared data for training:")
+        print(data.head())
         self.env = TradingEnv(data)
 
-        # Define the RL model (e.g., DQN)
         self.model = self._build_model()
 
-        # Training loop
         for e in range(1, self.episodes + 1):
             state = self.env.reset()
-            state = np.reshape(state, [1, 3])
+            state = np.reshape(state, [1, self.env.observation_space.shape[0]])
             total_reward = 0
 
             for time in range(self.env.n_steps):
+                # Continuous action selection
                 if np.random.rand() <= self.epsilon:
-                    action = random.randrange(self.env.action_space.n)
+                    action = np.random.uniform(-1, 1, size=(1,))
                 else:
-                    act_values = self.model.predict(state, verbose=0)
-                    action = np.argmax(act_values[0])
+                    action = self.model.predict(state, verbose=0)[0]
+                    action = np.clip(action, -1, 1)
 
                 next_state, reward, done, _ = self.env.step(action)
                 total_reward += reward
-                next_state = np.reshape(next_state, [1, 3])
+                next_state = np.reshape(next_state, [1, self.env.observation_space.shape[0]])
 
                 self.memory.append((state, action, reward, next_state, done))
 
                 state = next_state
 
                 if done:
-                    print(f"Episode: {e}/{self.episodes}, Total Reward: {total_reward:.2f}, Epsilon: {self.epsilon:.4f}")
+                    annual_return = self.env.get_annual_return()
+                    print(f"Episode: {e}/{self.episodes}, Total Reward: {total_reward:.4f}, Annual Return: {annual_return:.2%}, Epsilon: {self.epsilon:.4f}")
                     break
 
                 if len(self.memory) > self.batch_size:
                     minibatch = random.sample(self.memory, self.batch_size)
                     self._replay(minibatch)
 
-            # Decay epsilon
             if self.epsilon > self.epsilon_min:
                 self.epsilon *= self.epsilon_decay
 
@@ -172,243 +274,88 @@ class RLTradingAgent:
             pickle.dump(self.memory, f)
         print("Training completed and model saved.")
 
-    def continue_learning(self, additional_episodes=50, start_date=None, end_date=None):
-        """
-        Continue training the RL agent with additional episodes.
-        Optionally, train on new data by specifying start_date and end_date.
-        """
-        # Load the existing model
-        if self.model is None and os.path.exists('trading_agent.h5'):
-            self.model = load_model('trading_agent.h5', custom_objects={'AttentionLayer': AttentionLayer})
-            print("Loaded existing model from 'trading_agent.h5'.")
-        else:
-            if self.model is None:
-                raise Exception("No existing model found. Please train the model first using the learn() method.")
-
-        # If new data is provided, prepare it
-        if start_date and end_date:
-            new_data = self._prepare_data(start_date, end_date)
-            if self.env is not None:
-                # Append new data to existing environment's data
-                self.env.data = pd.concat([self.env.data, new_data], ignore_index=True)
-                self.env.n_steps = len(self.env.data) - 1
-                print(f"Appended new data. Total steps in environment: {self.env.n_steps}")
-            else:
-                # Create a new environment with the new data
-                self.env = TradingEnv(new_data)
-                print(f"Created new environment with data from {start_date} to {end_date}.")
-        elif self.env is None:
-            raise ValueError("No environment available. Provide start_date and end_date to prepare new data.")
-
-        # Continue training loop
-        for e in range(1, additional_episodes + 1):
-            state = self.env.reset()
-            state = np.reshape(state, [1, 3])
-            total_reward = 0
-
-            for time in range(self.env.n_steps):
-                if np.random.rand() <= self.epsilon:
-                    action = random.randrange(self.env.action_space.n)
-                else:
-                    act_values = self.model.predict(state, verbose=0)
-                    action = np.argmax(act_values[0])
-
-                next_state, reward, done, _ = self.env.step(action)
-                total_reward += reward
-                next_state = np.reshape(next_state, [1, 3])
-
-                self.memory.append((state, action, reward, next_state, done))
-
-                state = next_state
-
-                if done:
-                    print(f"Additional Episode: {e}/{additional_episodes}, Total Reward: {total_reward:.2f}, Epsilon: {self.epsilon:.4f}")
-                    break
-
-                if len(self.memory) > self.batch_size:
-                    minibatch = random.sample(self.memory, self.batch_size)
-                    self._replay(minibatch)
-
-            # Decay epsilon
-            if self.epsilon > self.epsilon_min:
-                self.epsilon *= self.epsilon_decay
-
-        # Save the updated model and memory
-        self.model.save('trading_agent.h5')
-        with open(self.memory_file, 'wb') as f:
-            pickle.dump(self.memory, f)
-        print("Continued training completed and model saved.")
-
     def work(self, current_state):
-        """Use the trained agent to make a trading decision based on the current state."""
-        # Load the trained model if not already loaded
+        """Make a trading decision based on the current state."""
         if self.model is None:
             if os.path.exists('trading_agent.h5'):
-                self.model = tf.keras.models.load_model('trading_agent.h5', custom_objects={'AttentionLayer': AttentionLayer})
+                self.model = tf.keras.models.load_model('trading_agent.h5')
                 print("Loaded trained model from 'trading_agent.h5'.")
             else:
                 raise Exception("No trained model found. Please train the model first.")
 
-        state = np.reshape(current_state, [1, 3])
-        act_values = self.model.predict(state, verbose=0)
-        action = np.argmax(act_values[0])
-        return action  # 0: Hold, 1: Buy, 2: Sell
+        state = np.reshape(current_state, [1, self.env.observation_space.shape[0]])
+        action = self.model.predict(state, verbose=0)[0]
+        action = np.clip(action, -1, 1)
+        return action  # Continuous action between -1 and 1
 
     def _prepare_data(self, start_date, end_date):
-        """Prepare data by fetching predictions and merging with actual prices."""
-        # Calculate the number of days between start and end dates
+        """Prepare data by fetching predictions and concatenating with actual prices."""
         start_dt = datetime.strptime(start_date, '%Y-%m-%d').date()
         end_dt = datetime.strptime(end_date, '%Y-%m-%d').date()
         num_days = (end_dt - start_dt).days
 
-        # Get predictions using the predict_future_prices function
+        # Fetch actual and predicted data
         last_actual_prices, predictions = predict_future_prices(start_date, num_days)
+        predictions = predictions.rename(columns={'Predicted_Price': 'Close'})
 
-        # Combine actual prices and predictions
-        data = pd.merge(last_actual_prices, predictions, on='Date', how='inner')
-        data = data.rename(columns={'Close': 'Actual_Close'})
+        # Concatenate historical and predicted data sequentially
+        data = pd.concat([last_actual_prices, predictions], ignore_index=True)
+
+        # Ensure required columns are present
+        required_columns = {'Close'}
+        missing_columns = required_columns - set(data.columns)
+        if missing_columns:
+            raise ValueError(f"Data is missing required columns: {missing_columns}")
+
+        # Apply technical indicators
+        data = add_technical_indicators(data)
+
+        # Fill missing values
+        data = data.bfill().ffill()
+        print("Data after filling NaNs and adding indicators:")
+        print(data.head())
         return data
 
     def _build_model(self):
-        """Builds a simple Deep Q-Network."""
+        """Builds a neural network model for continuous action output."""
         model = tf.keras.models.Sequential()
-        model.add(tf.keras.layers.Dense(24, input_dim=3, activation='relu'))
-        model.add(tf.keras.layers.Dense(24, activation='relu'))
-        model.add(tf.keras.layers.Dense(self.env.action_space.n, activation='linear'))
-        model.compile(loss='mse', optimizer=tf.keras.optimizers.Adam(lr=0.001))
-        print("Built new DQN model.")
+        model.add(tf.keras.layers.Dense(64, input_dim=self.env.observation_space.shape[0], activation='relu'))
+        model.add(tf.keras.layers.Dense(64, activation='relu'))
+        model.add(tf.keras.layers.Dense(32, activation='relu'))
+        model.add(tf.keras.layers.Dense(1, activation='tanh'))  # Output layer with tanh activation for actions between -1 and 1
+        model.compile(loss='mse', optimizer=tf.keras.optimizers.Adam(learning_rate=0.0005))
+        print("Built neural network model for continuous action space.")
         return model
 
     def _replay(self, minibatch):
         """Trains the model on a minibatch of experiences."""
-        for state, action, reward, next_state, done in minibatch:
-            target = reward
-            if not done:
-                target = reward + self.gamma * np.amax(self.model.predict(next_state, verbose=0)[0])
-            target_f = self.model.predict(state, verbose=0)
-            target_f[0][action] = target
-            self.model.fit(state, target_f, epochs=1, verbose=0)
+        states = np.array([experience[0] for experience in minibatch]).squeeze()
+        actions = np.array([experience[1] for experience in minibatch])
+        rewards = np.array([experience[2] for experience in minibatch])
+        next_states = np.array([experience[3] for experience in minibatch]).squeeze()
+        dones = np.array([experience[4] for experience in minibatch])
 
-    def save_memory(self):
-        """Saves the experience replay buffer to a file."""
-        with open(self.memory_file, 'wb') as f:
-            pickle.dump(self.memory, f)
-        print(f"Memory saved to {self.memory_file}.")
+        # Predict Q-values for next states
+        target_actions = self.model.predict(next_states, verbose=0)
+        target_actions = np.clip(target_actions, -1, 1)
 
-    def load_memory(self):
-        """Loads the experience replay buffer from a file."""
-        if os.path.exists(self.memory_file):
-            with open(self.memory_file, 'rb') as f:
-                self.memory = pickle.load(f)
-            print(f"Memory loaded from {self.memory_file}.")
-        else:
-            print("No memory file found. Starting with an empty memory buffer.")
+        # Compute targets
+        targets = rewards + self.gamma * (1 - dones) * np.squeeze(target_actions)
 
-
-# Required functions from predict.py (Assuming they are available)
-
-def predict_future_prices(start_date, num_points):
-    # Load the model directory
-    
-
-    # Load the trained model
-    model = load_model(os.path.join(model_dir, 'btc_price_model.keras'), custom_objects={'AttentionLayer': AttentionLayer})
-
-    # Load scalers and configurations
-    with open(os.path.join(model_dir, 'scaler_features.pkl'), 'rb') as f:
-        scaler_features = pickle.load(f)
-
-    with open(os.path.join(model_dir, 'scaler_target.pkl'), 'rb') as f:
-        scaler_target = pickle.load(f)
-
-    with open(os.path.join(model_dir, 'feature_columns.pkl'), 'rb') as f:
-        feature_columns = pickle.load(f)
-
-    with open(os.path.join(model_dir, 'target_column.pkl'), 'rb') as f:
-        target_column = pickle.load(f)
-
-    with open(os.path.join(model_dir, 'hyperparams.pkl'), 'rb') as f:
-        hyperparams = pickle.load(f)
-
-    window_size = hyperparams['window_size']
-
-    # Convert start_date to datetime
-    start_date_dt = datetime.strptime(start_date, '%Y-%m-%d').date()
-
-    # Calculate the date range needed for prediction
-    end_date_dt = start_date_dt + timedelta(days=num_points + window_size)
-
-    # Fetch BTC price data from start_date - window_size to end_date
-    data_start_date = start_date_dt - timedelta(days=window_size)
-    btc_df = yf.download('BTC-USD', start=data_start_date.strftime('%Y-%m-%d'), end=end_date_dt.strftime('%Y-%m-%d'), interval='1d')
-    btc_df.reset_index(inplace=True)
-    btc_df.columns = ['Date', 'Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']
-
-    # Fetch sentiment data
-    senticrypt_api_url = "https://api.senticrypt.com/v2/all.json"
-    response = requests.get(senticrypt_api_url)
-    if response.status_code == 200:
-        sentiment_data = response.json()
-    else:
-        raise Exception(f"Failed to fetch sentiment data. Status code: {response.status_code}")
-
-    sentiment_df = pd.DataFrame(sentiment_data)
-    btc_df['Date'] = pd.to_datetime(btc_df['Date']).dt.date
-    sentiment_df['date'] = pd.to_datetime(sentiment_df['date']).dt.date
-
-    # Merge BTC price data with sentiment data
-    merged_df = pd.merge(btc_df, sentiment_df, left_on='Date', right_on='date', how='inner')
-    merged_df.drop(columns=['date'], inplace=True)
-
-    # Apply feature engineering (same as training)
-    merged_df = add_technical_indicators(merged_df)
-
-    # Select features
-    scaled_features = scaler_features.transform(merged_df[feature_columns])
-
-    # Prepare sequences
-    X_pred = []
-    for i in range(window_size, len(scaled_features)):
-        X_pred.append(scaled_features[i - window_size:i])
-
-    X_pred = np.array(X_pred)
-
-    # Ensure we have enough data
-    if len(X_pred) < num_points:
-        raise Exception("Not enough data to make predictions. Please adjust the start date or number of points.")
-
-    # Make predictions
-    y_pred = model.predict(X_pred[-num_points:])
-    y_pred_rescaled = scaler_target.inverse_transform(y_pred)
-
-    # Prepare results
-    prediction_dates = merged_df['Date'].iloc[-num_points:].reset_index(drop=True)
-    results = pd.DataFrame({
-        'Date': prediction_dates,
-        'Predicted_Price': y_pred_rescaled.flatten()
-    })
-
-    # Get the last actual prices used for prediction
-    last_actual_prices = merged_df[['Date', 'Close']].iloc[-(num_points + num_points):-num_points].reset_index(drop=True)
-
-    return last_actual_prices, results
-
+        # Update the model
+        self.model.fit(states, targets, epochs=1, verbose=0)
+        
 def add_technical_indicators(data):
     # Moving Averages
     data['MA5'] = data['Close'].rolling(window=5).mean()
     data['MA10'] = data['Close'].rolling(window=10).mean()
     data['MA20'] = data['Close'].rolling(window=20).mean()
+    data['MA50'] = data['Close'].rolling(window=50).mean()
     
     # Standard Deviations
     data['STD5'] = data['Close'].rolling(window=5).std()
     data['STD10'] = data['Close'].rolling(window=10).std()
     data['STD20'] = data['Close'].rolling(window=20).std()
-    
-    # Daily Returns
-    data['Return'] = data['Close'].pct_change()
-    
-    # Volume Change
-    data['Volume_Change'] = data['Volume'].pct_change()
     
     # RSI Calculation
     data['RSI'] = compute_rsi(data['Close'], window=14)
@@ -437,59 +384,23 @@ def compute_macd(series, span_short=12, span_long=26, span_signal=9):
     signal = macd.ewm(span=span_signal, adjust=False).mean()
     return macd - signal
 
-# Custom Attention Layer
-from tensorflow.keras.layers import Layer
-from keras import backend as K
-
-class AttentionLayer(Layer):
-    def __init__(self, **kwargs):
-        super(AttentionLayer, self).__init__(**kwargs)
-    
-    def build(self, input_shape):
-        self.W = self.add_weight(name='att_weight', 
-                                 shape=(input_shape[-1], 1),
-                                 initializer='random_normal',
-                                 trainable=True)
-        self.b = self.add_weight(name='att_bias', 
-                                 shape=(input_shape[1], 1),
-                                 initializer='zeros',
-                                 trainable=True)
-        super(AttentionLayer, self).build(input_shape)
-    
-    def call(self, inputs):
-        e = K.tanh(K.dot(inputs, self.W) + self.b)
-        e = K.squeeze(e, axis=-1)
-        alpha = K.softmax(e)
-        alpha = K.expand_dims(alpha, axis=-1)
-        context = inputs * alpha
-        context = K.sum(context, axis=1)
-        return context
-    
-    def compute_output_shape(self, input_shape):
-        return (input_shape[0], input_shape[-1])
-
-
 # Main function to run the agent
 if __name__ == '__main__':
-    # Define the initial training time frame
     initial_start_date = '2020-01-01'
     initial_end_date = '2023-01-01'
 
-    # Initialize the RL trading agent
     agent = RLTradingAgent()
-
-    # Train the agent initially
     agent.learn(start_date=initial_start_date, end_date=initial_end_date)
 
-    # Example of continuing learning with additional data
-    additional_start_date = '2023-01-02'
-    additional_end_date = '2024-01-01'
-    agent.continue_learning(additional_episodes=20, start_date=additional_start_date, end_date=additional_end_date)
-
-    # Example of using the agent to make a trading decision
-    # Let's assume current_state is obtained from real-time data
-    # For demonstration, we'll use a sample state
-    current_state = np.array([50000, 0, 10000])  # Predicted_Price, Crypto_Held, Balance
+    current_state = np.array([
+        50000,    # Close
+        49500,    # MA10
+        49000,    # MA50
+        55,       # RSI
+        0.5,      # MACD
+        0,        # Crypto_Held
+        10000     # Balance
+    ])
     action = agent.work(current_state)
     action_dict = {0: 'Hold', 1: 'Buy', 2: 'Sell'}
     print(f'The agent recommends to: {action_dict[action]}')

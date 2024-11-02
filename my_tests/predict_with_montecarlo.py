@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 # Suppress TensorFlow warnings
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
-def predict_future_prices(start_date, num_points, mc_iterations=100):
+def predict_future_prices(start_date, num_points, mc_iterations=10):
     """
     Predict future Bitcoin prices with confidence intervals using Monte Carlo Dropout.
 
@@ -73,7 +73,7 @@ def predict_future_prices(start_date, num_points, mc_iterations=100):
 
     sentiment_df = pd.DataFrame(sentiment_data)
     btc_df['Date'] = pd.to_datetime(btc_df['Date']).dt.date
-    sentiment_df['date'] = pd.to_datetime(senticrypt_api_url).dt.date  # Corrected to 'sentiment_df'
+    sentiment_df['date'] = pd.to_datetime(sentiment_df['date']).dt.date  # Corrected to 'sentiment_df'
 
     # Merge BTC price data with sentiment data
     merged_df = pd.merge(btc_df, sentiment_df, left_on='Date', right_on='date', how='inner')
@@ -81,7 +81,7 @@ def predict_future_prices(start_date, num_points, mc_iterations=100):
 
     # Apply feature engineering (same as training)
     merged_df = add_technical_indicators(merged_df)
-
+    print(merged_df.head)
     # Select features
     scaled_features = scaler_features.transform(merged_df[feature_columns])
 
@@ -208,8 +208,8 @@ class AttentionLayer(Layer):
 # Main function
 if __name__ == '__main__':
     start_date = '2023-01-01'  # Adjust as needed
-    num_points = 10  # Number of future points to predict
-    mc_iterations = 100  # Number of Monte Carlo iterations
+    num_points = 3  # Number of future points to predict
+    mc_iterations = 10  # Number of Monte Carlo iterations
 
     # Get the last actual prices and predictions with confidence
     last_actual_prices, predictions = predict_future_prices(start_date, num_points, mc_iterations)
