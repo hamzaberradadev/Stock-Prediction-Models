@@ -269,7 +269,7 @@ class RLTradingAgent:
                 self.epsilon *= self.epsilon_decay
 
         # Save the trained model and memory
-        self.model.save('trading_agent.h5')
+        self.model.save('trading_agent.keras')
         with open(self.memory_file, 'wb') as f:
             pickle.dump(self.memory, f)
         print("Training completed and model saved.")
@@ -277,9 +277,9 @@ class RLTradingAgent:
     def work(self, current_state):
         """Make a trading decision based on the current state."""
         if self.model is None:
-            if os.path.exists('trading_agent.h5'):
-                self.model = tf.keras.models.load_model('trading_agent.h5')
-                print("Loaded trained model from 'trading_agent.h5'.")
+            if os.path.exists('trading_agent.keras'):
+                self.model = tf.keras.models.load_model('trading_agent.keras')
+                print("Loaded trained model from 'trading_agent.keras'.")
             else:
                 raise Exception("No trained model found. Please train the model first.")
 
